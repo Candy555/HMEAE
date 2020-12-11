@@ -1,7 +1,9 @@
 import tensorflow as tf
 import constant
-from func import get_batch,get_trigger_feeddict,f_score,get_argument_feeddict
+from func import get_batch,get_trigger_feeddict,f_score,get_argument_feeddict,GAC_func,Cudnn_RNN,matmuls
 import numpy as np
+import tqdm
+from confusion_loss import f1_confusion_loss
 class DMCNN():
     def __init__(self,t_data,a_data,maxlen,max_argument_len,wordemb,stage="trigger",classify='single'):
         self.t_train,self.t_dev,self.t_test = t_data
@@ -169,6 +171,9 @@ class DMCNN():
     def build_HMEAE(self,scope="HMEAE"):
         maxlen = self.maxlen
         num_class = len(constant.ROLE_TO_ID)
+        #新增的变量
+        keepprob = constant.t_keepprob
+
         with tf.variable_scope(scope,reuse=tf.AUTO_REUSE):
             with tf.variable_scope('Initialize'):
                 posi_mat = tf.concat(
@@ -185,6 +190,7 @@ class DMCNN():
             
                 u_c = tf.get_variable('feat_vatiable',[constant.module_num,1,constant.a_u_c_dim],initializer=tf.contrib.layers.xavier_initializer())   
                 module_design = tf.constant(constant.module_design,tf.float32)
+
             with tf.variable_scope('placeholder'):
                 self.sents = sents = tf.placeholder(tf.int32,[None,maxlen],'sents')
                 self.trigger_posis = trigger_posis = tf.placeholder(tf.int32,[None,maxlen],'trigger_posis')
@@ -198,11 +204,26 @@ class DMCNN():
                 self._labels = _labels = tf.placeholder(tf.int32,[None],'labels')
                 labels = tf.one_hot(_labels,num_class)
                 self.is_train = is_train = tf.placeholder(tf.bool,[],'is_train')
+
+                #sents,event_types,roles,maskl,maskm,maskr,\
+                #trigger_lexical,argument_lexical,trigger_maskl,trigger_maskr,trigger_posis,argument_posis
                 
+                #新增的变量
+                self.is_negative = tf.placeholder(tf.float32,[None])
+                # self.pos_idx = pos_idx = tf.placeholder(tf.int32,[None,maxlen],'pos_tags')
+                # self.subg_a =  tf.sparse_placeholder(tf.float32,[None,maxlen,maxlen],'subg')
+                # self.subg_b =  tf.sparse_transpose(self.subg_a,[0,2,1])
+                # self.gather_idxs = tf.placeholder(tf.int32,[None,2],'gather_idxs')
+                # subg_a = tf.sparse_tensor_to_dense(self.subg_a,validate_indices=False)
+                # subg_b = tf.sparse_tensor_to_dense(self.subg_b,validate_indices=False)
+                
+                # eyes = tf.tile(tf.expand_dims(tf.eye(maxlen),0),[tf.shape(pos_idx)[0],1,1])
+
                 sents_len = tf.reduce_sum(tf.cast(tf.cast(sents,tf.bool),tf.int32),axis=1)
                 sents_mask = tf.sequence_mask(sents_len,maxlen,tf.float32)
                 event_types = tf.tile(tf.expand_dims(event_types,axis=1),[1,maxlen])*tf.cast(sents_mask,tf.int32)
                 batch_size = tf.shape(sents)[0]
+
             with tf.variable_scope('embedding'):
                 sents_emb = tf.nn.embedding_lookup(word_mat,sents)
                 trigger_posis_emb  = tf.nn.embedding_lookup(posi_mat,trigger_posis)
@@ -210,46 +231,57 @@ class DMCNN():
                 argument_posis_emb = tf.nn.embedding_lookup(posi_mat,argument_posis)
                 argument_lexical_emb = tf.nn.embedding_lookup(word_mat,argument_lexical)
                 event_type_emb = tf.nn.embedding_lookup(event_mat,event_types)
+
             with tf.variable_scope('lexical_feature'):
                 trigger_lexical_feature = tf.reshape(trigger_lexical_emb,[-1,3*constant.embedding_dim])
                 argument_len = tf.reduce_sum(tf.cast(tf.cast(argument_lexical[:,1:-1],tf.bool),tf.float32),axis=1,keepdims=True)
                 argument_lexical_mid = tf.reduce_sum(argument_lexical_emb[:,1:-1,:],axis=1)/argument_len
                 argument_lexical_feature = tf.concat([argument_lexical_emb[:,0,:],argument_lexical_mid,argument_lexical_emb[:,-1,:]],axis=1)
                 lexical_feature = tf.concat([trigger_lexical_feature,argument_lexical_feature],axis=1)
+
             with tf.variable_scope('encoder'):
                 emb = tf.concat([sents_emb,trigger_posis_emb,argument_posis_emb,event_type_emb],axis=2)
-                # emb shape: (?, 228, 115)
-                # print("emb shape:",emb.shape)
-                emb_shape = tf.shape(emb)
-                pad = tf.zeros([emb_shape[0],1,emb_shape[2]],tf.float32)
-                # pad.shape: (?, 1, ?)
-                # print("pad.shape:",pad.shape)
-                # print("pad:",pad)
-                conv_input = tf.concat([pad,emb,pad],axis=1)
-                # conv_input: Tensor("HMEAE/encoder/concat_1:0", shape=(?, 230, 115), dtype=float32)
-                # print("conv_input:",conv_input)
-                conv_res = tf.layers.conv1d(
-                        inputs=conv_input,
-                        filters=constant.a_filters,# a_filters = 300 
-                        kernel_size=3,
-                        strides=1,
-                        padding='valid',
-                        activation=tf.nn.relu,
-                        kernel_initializer=tf.contrib.layers.xavier_initializer(),
-                        name='convlution_layer')
-                conv_res = tf.reshape(conv_res,[-1,maxlen,constant.a_filters])
-                #conv_res: (?, 228, 300)
-                # print("conv_res:",conv_res.shape)
+                # emb_shape = tf.shape(emb)
+                # pad = tf.zeros([emb_shape[0],1,emb_shape[2]],tf.float32)
+                # conv_input = tf.concat([pad,emb,pad],axis=1)
+                # conv_res = tf.layers.conv1d(
+                #         inputs=conv_input,
+                #         filters=constant.a_filters, kernel_size=3,
+                #         strides=1,
+                #         padding='valid',
+                #         activation=tf.nn.relu,
+                #         kernel_initializer=tf.contrib.layers.xavier_initializer(),
+                #         name='convlution_layer')
+                # conv_res = tf.reshape(conv_res,[-1,maxlen,constant.a_filters])
+                rnn = Cudnn_RNN(num_layers=1, num_units=constant.hidden_dim, keep_prob=keepprob, is_train=self.is_train)
+                conv_res,_ = rnn(emb, seq_len=sents_len, concat_layers=False,keep_prob=keepprob,is_train=self.is_train)
 
-            
+                #GAT
+                # hs = []
+                # for layer in range(1,constant.K+1):
+                #     # h_layer= GAC_func(conv_res,matmuls(subg_a,layer),maxlen,'a',layer)+GAC_func(conv_res,matmuls(subg_b,layer),maxlen,'b',layer)+GAC_func(conv_res,eyes,maxlen,'c',layer)
+                #     h_layer= GAC_func(conv_res,matmuls(subg_a,layer),maxlen,'a',layer)+GAC_func(conv_res,matmuls(subg_b,layer),maxlen,'b',layer)
+                #     hs.append(h_layer)
+
+                # s_ctxs = []
+                # for layer in range(1,constant.K+1):
+                #     s_raw = tf.layers.dense(hs[layer-1],constant.s_dim,name='Wawa')
+                #     s_layer = tf.nn.tanh(s_raw)
+                #     ctx_apply = tf.layers.dense(s_layer,1,name='ctx',use_bias=False)
+                #     s_ctxs.append(ctx_apply)
+                # vs = tf.nn.softmax(tf.concat(s_ctxs,axis=2),axis=2) #[None,maxlen,3]
+                # h_concats = tf.concat([tf.expand_dims(hs[layer],2) for layer in range(constant.K)],axis=2)
+                # final_h = tf.reduce_sum(tf.multiply(tf.expand_dims(vs,3),h_concats),axis=2)
+                # gather_final_h = tf.gather_nd(final_h,self.gather_idxs)
+
+                # #新增的维度变换
+                # conv_res = tf.reshape(gather_final_h,[-1,maxlen,constant.a_filters])
+
             with tf.variable_scope("attention"):
-                #tf.tile平铺，用于在同一维度上的复制
                 conv_res_extend = tf.tile(tf.expand_dims(conv_res,axis=1),[1,constant.module_num,1,1])
                 u_c_feat = tf.tile(tf.expand_dims(u_c,axis=0),[batch_size,1,maxlen,1])*tf.tile(tf.expand_dims(tf.expand_dims(sents_mask,axis=2),axis=1),[1,constant.module_num,1,1])
                 hidden_state = tf.layers.dense(tf.concat([conv_res_extend,u_c_feat],axis=3),constant.a_W_a_dim,use_bias=False,kernel_initializer=tf.contrib.layers.xavier_initializer(),activation=tf.nn.tanh)
-                
                 score_logit = tf.reshape(tf.layers.dense(hidden_state,1,use_bias=False,kernel_initializer=tf.contrib.layers.xavier_initializer()),[batch_size,constant.module_num,maxlen])
-                #为什么有mask机制？？
                 score_mask = tf.tile(tf.expand_dims(sents_mask,axis=1),[1,constant.module_num,1])
                 score_logit = score_logit*score_mask-(1-score_mask)*constant.INF
                 module_score = tf.nn.softmax(score_logit,axis=2)
@@ -258,6 +290,7 @@ class DMCNN():
                 module_of_role = tf.expand_dims(tf.expand_dims(tf.reduce_sum(module_design,axis=1),axis=0),axis=2)
                 role_score = tf.reduce_sum(score_mask,axis=2)/module_of_role
                 role_oriented_emb = tf.reduce_sum(tf.expand_dims(role_score,axis=3)*tf.tile(tf.expand_dims(conv_res,axis=1),[1,len(constant.ROLE_TO_ID),1,1]),axis=2)
+
             with tf.variable_scope('maxpooling'):
                 maskl = tf.tile(tf.expand_dims(maskls,axis=2),[1,1,constant.a_filters])
                 left = maskl*conv_res
@@ -266,6 +299,7 @@ class DMCNN():
                 maskr = tf.tile(tf.expand_dims(maskrs,axis=2),[1,1,constant.a_filters])
                 right = maskr*conv_res
                 sentence_feature = tf.concat([tf.reduce_max(left,axis=1),tf.reduce_max(mid,axis=1),tf.reduce_max(right,axis=1)],axis=1)
+                
             with tf.variable_scope('classifier'):
                 dmcnn_feature = tf.concat([sentence_feature,lexical_feature],axis=1)
                 hmeae_feature = tf.concat([tf.tile(tf.expand_dims(dmcnn_feature,axis=1),[1,len(constant.ROLE_TO_ID),1]),role_oriented_emb],axis=2)
@@ -275,7 +309,13 @@ class DMCNN():
                 self.logits = logits = tf.reduce_max(eye_mask*dense_res-(1-eye_mask)*constant.INF,axis=2)
                 self.pred = pred = tf.nn.softmax(logits,axis=1)
                 self.pred_label = pred_label = tf.argmax(pred,axis=1)
-                self.loss = loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels,logits=logits),axis=0)
+                #新增的变量
+                wrong_confusion_matrix = [[0.0] * num_class] *num_class
+                correct_class_weight = [1.0] * num_class
+                positive_idx = 15.0
+                negative_idx = 1-positive_idx 
+                self.loss = loss = tf.reduce_mean(f1_confusion_loss(_labels, logits,positive_idx, negative_idx, correct_class_weight, wrong_confusion_matrix, num_class))
+                # self.loss = loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(labels=labels,logits=logits),axis=0)
                 self.train_op = train_op = tf.train.AdamOptimizer(constant.a_lr).minimize(loss)
             
     def train_argument(self):
